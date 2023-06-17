@@ -58,66 +58,90 @@ unsigned long find_symbol(char* symbol_name, char* exe_file_name, int* error_val
 
     // All set to start finding the symbol table
 
-    Elf64_Shdr section_header;
-
-    size_t Shdr_size = sizeof(section_header);
-    long offset_of_Shdr = elf_header.e_shoff + elf_header.e_shentsize * elf_header.e_shstrndx; // Calculate the offset to section header names/section header string table
-
-    fseek(exe_file, offset_of_Shdr, SEEK_SET);
-    fread(&section_header, Shdr_size, 1, exe_file); // Update "Elf64_Shdr section_header"
-
-    fseek(exe_file, elf_header.e_shoff, SEEK_SET);
-
-    // Find the section header string table
-
-    char *section_names = malloc(section_header.sh_size);
-    fseek(exe_file, section_header.sh_offset, SEEK_SET);
-    fread(section_names, section_header.sh_size, 1, exe_file);
-
     // Find the symbol table section
 
     Elf64_Shdr symbol_table_header;
+    Elf64_Shdr string_table;
+    Elf64_Shdr current;
+
+    size_t sht_size = elf_header.e_shnum * elf_header.e_shentsize;
+    fseek(exe_file, elf_header.e_shoff, SEEK_SET);
+
+    uint8_t sht[sht_size];
+    fread(sht, elf_header.e_shentsize, elf_header.e_shnum, exe_file);
+    size_t Shdr_size = sizeof(current);
+    Elf64_Shdr* strtab_sh = NULL;
+    Elf64_Shdr* shstrtab_sh = (void *) sht + elf_header.e_shstrndx * elf_header.e_shentsize;
+
+    uint8_t shstrtab[shstrtab_sh->sh_size];
+    fseek(exe_file, shstrtab_sh->sh_offset, SEEK_SET);
+    fread(shstrtab, 1, sizeof(shstrtab), exe_file);
+
+    for(size_t i = 0; i < elf_header.e_shnum; ++i)
+    {
+        Elf64_Shdr *sh = (void *) sht + i * elf_header.e_shentsize;
+
+        char* str = shstrtab + sh->sh_name;
+
+        if(strcmp(".strtab", shstrtab + sh->sh_name))
+        {
+            continue;
+        }
+
+        // We found the string table.
+        strtab_sh = sh;
+        break;
+    }
 
     for (int i = 0; i < elf_header.e_shnum; i++)
     {
-        printf("\n%d\n", i);
-        fread(&symbol_table_header, Shdr_size, 1, exe_file);
+        fseek(exe_file, elf_header.e_shoff + i * elf_header.e_shentsize, SEEK_SET);
+        fread(&current, Shdr_size, 1, exe_file);
 
-        if (symbol_table_header.sh_type == 2)
-            break;
-
-        fseek(exe_file, elf_header.e_shentsize - Shdr_size, SEEK_CUR);
+        if (ELF64_R_TYPE(current.sh_type) == SHT_SYMTAB)
+        {
+            symbol_table_header = current;
+        }
+        else if(ELF64_R_TYPE(current.sh_type) == 3)
+        {
+            string_table = current;
+        }
     }
 
-    if (symbol_table_header.sh_type != SHT_SYMTAB)
-    {
-        *error_val = -1; // Symbol table not found
-        printf("\nwassup\n");
-        fclose(exe_file);
-        free(section_names);
-        return 0;
-    }
-
-    // Read the symbol table entries
-
-    Elf64_Sym symbol;
-    size_t symbol_size = sizeof(symbol);
-
+    int symbolCount = symbol_table_header.sh_size / sizeof(Elf64_Sym);
+    Elf64_Sym sym;
+    uint8_t symtab[symbol_table_header.sh_size];
     fseek(exe_file, symbol_table_header.sh_offset, SEEK_SET);
+    fread(symtab, symbol_table_header.sh_entsize, symbolCount, exe_file);
 
-    while (fread(&symbol, symbol_size, 1, exe_file))
+    uint8_t strtab[strtab_sh->sh_size];
+    fseek(exe_file, strtab_sh->sh_offset, SEEK_SET);
+    fread(strtab, 1, sizeof(strtab), exe_file);
+
+    Elf64_Sym* symbol;// = (void *) symtab + i * symbol_table_header.sh_entsize;
+    size_t sym_index = 0;
+
+    for(sym_index; sym_index < symbolCount; sym_index++)
     {
-        char *symbol_name_str = section_names + symbol_table_header.sh_link + symbol.st_name;
+        symbol = (void *) symtab + sym_index * symbol_table_header.sh_entsize;
+        char* name = strtab + symbol->st_name;
 
-        if (strcmp(symbol_name_str, symbol_name) == 0)
+        // If the name is empty skip this symbol.
+        if(name == NULL)
+            continue;
+
+        if(strcmp(name, symbol_name) == 0)
         {
             symbol_flag = true;
             break;
         }
+        else
+        {
+            symbol_flag = false;
+        }
     }
 
     fclose(exe_file);
-    free(section_names);
 
     if (!symbol_flag)
     {
@@ -125,20 +149,33 @@ unsigned long find_symbol(char* symbol_name, char* exe_file_name, int* error_val
         return 0;
     }
 
-    if (ELF64_ST_BIND(symbol.st_info) == STB_LOCAL)
+    if (ELF64_ST_BIND(symbol->st_info) == STB_LOCAL)
     {
-        *error_val = -2; // Symbol is not global
-        return 0;
+        bool flag = false;
+        for(size_t i = sym_index + 1; i < symbolCount; i++) {
+            symbol = (void *) symtab + i * symbol_table_header.sh_entsize;
+            char *name = strtab + symbol->st_name;
+            if(strcmp(name, symbol_name) == 0)
+            {
+                flag = true;
+                break;
+            }
+        }
+        if(!flag)
+        {
+            *error_val = -2; // Symbol is not global
+            return 0;
+        }
     }
 
-    if (symbol.st_shndx == SHN_UNDEF)
+    if (symbol->st_shndx == SHN_UNDEF)
     {
         *error_val = -4; // Symbol is global but will come from a shared library
         return 0;
     }
 
     *error_val = 1; // Symbol is found and is global
-    return symbol.st_value;
+    return symbol->st_value;
 }
 
 int main(int argc, char *const argv[]) {
